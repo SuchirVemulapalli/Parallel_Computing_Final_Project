@@ -1,5 +1,6 @@
 #include <iostream>
 #include <vector>
+#include <cmath>
 #include <cuda_runtime.h>
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -9,10 +10,10 @@
 #include "stb_image_write.h"
 
 // =====================================================================
-// ORB BRIEF PATTERN (first 256 pairs from OpenCV ORB)
+// ORB PATTERN (Host Side)
+// We define this as a standard C array and copy it to GPU in main()
 // =====================================================================
-
-__device__ __constant__ int ORB_pattern[256*4] =
+const int h_ORB_pattern[256*4] =
 {
     8,-3, 9,5/*mean (0), correlation (0)*/,
     4,2, 7,-12/*mean (1.12461e-05), correlation (0.0437584)*/,
@@ -273,22 +274,78 @@ __device__ __constant__ int ORB_pattern[256*4] =
 };
 
 // =====================================================================
-// CUDA Kernel: ORB Descriptor
-// expects:
-//    grayscale input image (d_img)
-//    keypoints mask (d_kpmask == 255 means keypoint)
-// outputs:
-//    descriptors: each keypoint → 256 bytes (bits 0/1)
+// DEVICE HELPER FUNCTIONS
 // =====================================================================
 
+// Bilinear Interpolation for better Rotation Invariance
 __device__
-float fastAt(const unsigned char* img, int x, int y, int width, int height) {
-    if (x < 0 || x >= width || y < 0 || y >= height) return 0;
-    return img[y * width + x];
+float bilinearAt(const unsigned char* img, float x, float y, int width, int height) {
+    // Floor inputs
+    int x1 = (int)x;
+    int y1 = (int)y;
+    int x2 = x1 + 1;
+    int y2 = y1 + 1;
+
+    // Bounds check (safe guard, though we usually skip borders in kernel)
+    if (x1 < 0 || x2 >= width || y1 < 0 || y2 >= height) return 0.0f;
+
+    // Get pixels
+    float p11 = img[y1 * width + x1];
+    float p12 = img[y1 * width + x2];
+    float p21 = img[y2 * width + x1];
+    float p22 = img[y2 * width + x2];
+
+    // Weights
+    float wx = x - x1;
+    float wy = y - y1;
+
+    // Interpolate
+    float val = (1.0f - wy) * ((1.0f - wx) * p11 + wx * p12) +
+                (wy) * ((1.0f - wx) * p21 + wx * p22);
+    
+    return val;
 }
 
+// =====================================================================
+// CUDA Kernel: Gaussian Blur (5x5)
+// Helps remove noise so BRIEF descriptors are stable on flat textures
+// =====================================================================
+__global__ 
+void gaussianBlur(const unsigned char* input, unsigned char* output, int width, int height) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= width || y >= height) return;
+
+    // 5x5 Separable Kernel Weights: [1, 4, 6, 4, 1]
+    // Combined 2D weights are just vector_y * vector_x
+    int kernel[5] = {1, 4, 6, 4, 1};
+    
+    int sum = 0;
+    int weightSum = 0;
+
+    for (int ky = -2; ky <= 2; ky++) {
+        for (int kx = -2; kx <= 2; kx++) {
+            // Clamp coordinates to image borders
+            int px = min(max(x + kx, 0), width - 1);
+            int py = min(max(y + ky, 0), height - 1);
+            
+            int w = kernel[ky+2] * kernel[kx+2];
+            sum += input[py * width + px] * w;
+            weightSum += w; // Total is 256
+        }
+    }
+
+    output[y * width + x] = (unsigned char)(sum / weightSum);
+}
+
+// =====================================================================
+// CUDA Kernel: ORB Descriptor
+// =====================================================================
 __global__
-void orbKernel(const unsigned char* img, const unsigned char* kp,
+void orbKernel(const unsigned char* img, 
+               const unsigned char* kp,
+               const int* pattern,      // Passed as a pointer to global memory
                unsigned char* descriptors,
                int width, int height)
 {
@@ -296,80 +353,101 @@ void orbKernel(const unsigned char* img, const unsigned char* kp,
     int total = width * height;
 
     if (idx >= total) return;
+    
+    // 1. Check if this is a keypoint
     if (kp[idx] == 0) return;
 
     int y = idx / width;
     int x = idx % width;
 
-    const int PATCH = 16;
+    // 2. Boundary Check
+    // The patch is roughly 31x31 (radius ~16). 
+    // If we are too close to edge, rotation might go out of bounds.
+    // OpenCV usually ignores pixels within ~31 pixels of border.
+    const int BORDER = 24; 
+    if (x < BORDER || x >= width - BORDER || y < BORDER || y >= height - BORDER) {
+        // Mark descriptor as empty or just leave it. 
+        // Here we just exit, leaving memory 0 (black descriptor).
+        return; 
+    }
 
-    // --------------------------------------------------------
-    // Compute Orientation via intensity centroid
-    // --------------------------------------------------------
+    const int PATCH_R = 16; 
+
+    // 3. Compute Orientation (Intensity Centroid)
     float m01 = 0, m10 = 0;
 
-    for (int dy = -PATCH; dy <= PATCH; dy++) {
-        for (int dx = -PATCH; dx <= PATCH; dx++) {
-            int xx = x + dx, yy = y + dy;
-            float v = fastAt(img, xx, yy, width, height);
-            m10 += dx * v;
-            m01 += dy * v;
+    // Optimization: Unrolling loops or using shared memory helps here, 
+    // but naive implementation is fine for functionality.
+    for (int dy = -PATCH_R; dy <= PATCH_R; dy++) {
+        for (int dx = -PATCH_R; dx <= PATCH_R; dx++) {
+            // Circular mask is better for rotation invariance than a square box
+            if (dx*dx + dy*dy > PATCH_R*PATCH_R) continue;
+
+            float val = img[(y + dy) * width + (x + dx)];
+            m10 += dx * val;
+            m01 += dy * val;
         }
     }
 
     float angle = atan2f(m01, m10);
-    float ca = cosf(angle), sa = sinf(angle);
+    float ca = cosf(angle);
+    float sa = sinf(angle);
 
-    unsigned char* desc = &descriptors[idx * 32]; // 32 bytes = 256 bits
+    unsigned char* desc = &descriptors[idx * 32]; 
 
-    // --------------------------------------------------------
-    // 256-bit BRIEF test using rotated sampling pattern
-    // --------------------------------------------------------
+    // 4. Compute Descriptor
+    // Loop over 32 bytes (256 bits)
     for (int byte = 0; byte < 32; byte++) {
         unsigned char outByte = 0;
 
         for (int bit = 0; bit < 8; bit++) {
             int k = 8 * byte + bit;
 
-            int x1 = ORB_pattern[2*k][0];
-            int y1 = ORB_pattern[2*k][1];
-            int x2 = ORB_pattern[2*k+1][0];
-            int y2 = ORB_pattern[2*k+1][1];
+            // --- FIX 1: Correct Pattern Indexing ---
+            // Pattern has 4 ints per test: x1, y1, x2, y2
+            int px1 = pattern[k * 4 + 0];
+            int py1 = pattern[k * 4 + 1];
+            int px2 = pattern[k * 4 + 2];
+            int py2 = pattern[k * 4 + 3];
 
-            // rotate
-            int rx1 = x + (int)( ca * x1 - sa * y1 );
-            int ry1 = y + (int)( sa * x1 + ca * y1 );
-            int rx2 = x + (int)( ca * x2 - sa * y2 );
-            int ry2 = y + (int)( sa * x2 + ca * y2 );
+            // --- FIX 2: Correct Rotation Logic ---
+            // Apply rotation matrix to the offsets
+            float rx1 = x + (ca * px1 - sa * py1);
+            float ry1 = y + (sa * px1 + ca * py1);
+            
+            float rx2 = x + (ca * px2 - sa * py2);
+            float ry2 = y + (sa * px2 + ca * py2);
 
-            float p1 = fastAt(img, rx1, ry1, width, height);
-            float p2 = fastAt(img, rx2, ry2, width, height);
+            // --- FIX 3: Bilinear Interpolation ---
+            float val1 = bilinearAt(img, rx1, ry1, width, height);
+            float val2 = bilinearAt(img, rx2, ry2, width, height);
 
-            if (p1 < p2)
+            if (val1 < val2) {
                 outByte |= (1 << bit);
+            }
         }
-
         desc[byte] = outByte;
     }
 }
-
 
 // =====================================================================
 // MAIN
 // =====================================================================
 int main(int argc, char** argv)
 {
-    if (argc < 4) {
-        std::cerr << "Usage: ./orb_descriptor original.png keypoints.png descriptors.bin\n";
+    if (argc < 5) {
+        std::cerr << "Usage: ./brief <img.png> <kp_mask.png> <out_desc.bin> <out_keypoints.bin>\n";
         return 1;
     }
 
-    const char* inputImg = argv[1];     // original grayscale image
-    const char* kpImg = argv[2];        // FAST-Harris output
-    const char* outFile = argv[3];      // binary descriptor file
+    const char* inputImg = argv[1];
+    const char* kpImg    = argv[2];
+    const char* outDesc  = argv[3];
+    const char* outKp    = argv[4];
 
     int w1,h1,c1, w2,h2,c2;
 
+    // Load images
     unsigned char* h_img = stbi_load(inputImg, &w1, &h1, &c1, 1);
     unsigned char* h_kp  = stbi_load(kpImg,  &w2, &h2, &c2, 1);
 
@@ -379,55 +457,116 @@ int main(int argc, char** argv)
     }
 
     if (w1!=w2 || h1!=h2) {
-        std::cerr << "Image and keypoint map sizes differ!\n";
+        std::cerr << "Dimension mismatch.\n";
         return 1;
     }
 
     int imgSize = w1 * h1;
 
-    // Allocate GPU
+    // GPU Allocations
     unsigned char *d_img, *d_kp, *d_desc;
+    unsigned char *d_blurred; // <--- NEW: Pointer for blurred image
+    int *d_pattern;
+
     cudaMalloc(&d_img, imgSize);
+    cudaMalloc(&d_blurred, imgSize); // <--- NEW: Allocate blur memory
     cudaMalloc(&d_kp,  imgSize);
-
-    // each pixel → 32-byte descriptor
     cudaMalloc(&d_desc, imgSize * 32);
+    cudaMalloc(&d_pattern, sizeof(h_ORB_pattern)); 
 
+    // Copy Data to GPU
     cudaMemcpy(d_img, h_img, imgSize, cudaMemcpyHostToDevice);
     cudaMemcpy(d_kp,  h_kp,  imgSize, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_pattern, h_ORB_pattern, sizeof(h_ORB_pattern), cudaMemcpyHostToDevice);
 
-    dim3 threads(256);
-    dim3 blocks((imgSize + 255) / 256);
+    // Initialize descriptors to 0
+    cudaMemset(d_desc, 0, imgSize * 32);
 
-    orbKernel<<<blocks, threads>>>(d_img, d_kp, d_desc, w1, h1);
+    std::cout << "Applying Gaussian Blur..." << std::endl;
+
+    // =================================================================
+    // STEP 1: RUN GAUSSIAN BLUR
+    // =================================================================
+    dim3 blurBlock(16, 16);
+    dim3 blurGrid((w1 + 15) / 16, (h1 + 15) / 16);
+    
+    // Input: d_img (Raw) -> Output: d_blurred (Smooth)
+    gaussianBlur<<<blurGrid, blurBlock>>>(d_img, d_blurred, w1, h1);
     cudaDeviceSynchronize();
 
-    // Copy back
+    std::cout << "Running ORB Kernel..." << std::endl;
+
+    // =================================================================
+    // STEP 2: RUN ORB KERNEL (USING BLURRED IMAGE)
+    // =================================================================
+    dim3 threads(256);
+    dim3 blocks((imgSize + 255) / 256);
+    
+    // NOTICE: First argument is now 'd_blurred', NOT 'd_img'
+    orbKernel<<<blocks, threads>>>(d_blurred, d_kp, d_pattern, d_desc, w1, h1);
+    
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        std::cerr << "CUDA Error: " << cudaGetErrorString(err) << "\n";
+        return 1;
+    }
+
+    // Copy descriptors back to Host
     std::vector<unsigned char> h_desc(imgSize * 32);
     cudaMemcpy(h_desc.data(), d_desc, imgSize * 32, cudaMemcpyDeviceToHost);
 
-    // Count how many keypoints
-    int count = 0;
-    for (int i=0;i<imgSize;i++)
-        if (h_kp[i] == 255) count++;
+    // Save Logic (Descriptors + Keypoints)
+    FILE* f_desc = fopen(outDesc, "wb");
+    FILE* f_kp   = fopen(outKp,   "wb");
 
-    std::cout << "Detected " << count << " keypoints\n";
-
-    // Write descriptors (only for keypoints)
-    FILE* f = fopen(outFile, "wb");
-    for (int i=0;i<imgSize;i++) {
-        if (h_kp[i] == 255)
-            fwrite(&h_desc[i*32], 1, 32, f);
+    if (!f_desc || !f_kp) {
+        std::cerr << "Error opening output files for writing!\n";
+        return 1;
     }
-    fclose(f);
 
+    int count = 0;
+    const int HOST_BORDER = 24;
+    for (int i=0; i<imgSize; i++) {
+        if (h_kp[i] == 255) {
+            
+            // Calculate X and Y on CPU
+            int px = i % w1;
+            int py = i / w1;
+
+           
+            if (px < HOST_BORDER || px >= w1 - HOST_BORDER || 
+                py < HOST_BORDER || py >= h1 - HOST_BORDER) {
+                continue; // Skip saving this "zombie" keypoint
+            }
+
+
+            // Write Descriptor
+            fwrite(&h_desc[i*32], 1, 32, f_desc);
+
+            // Write Coordinates
+            float kx = (float)(i % w1); 
+            float ky = (float)(i / w1);
+            fwrite(&kx, sizeof(float), 1, f_kp);
+            fwrite(&ky, sizeof(float), 1, f_kp);
+
+            count++;
+        }
+    }
+
+    fclose(f_desc);
+    fclose(f_kp);
+
+    std::cout << "Successfully saved " << count << " descriptors and keypoints.\n";
+
+    // Cleanup
     cudaFree(d_img);
+    cudaFree(d_blurred); // <--- Don't forget to free the new buffer
     cudaFree(d_kp);
     cudaFree(d_desc);
+    cudaFree(d_pattern);
 
     stbi_image_free(h_img);
     stbi_image_free(h_kp);
 
-    std::cout << "Descriptors saved to " << outFile << "\n";
     return 0;
 }
