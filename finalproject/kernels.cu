@@ -1,24 +1,14 @@
-// fast_harris_topN.cu
+#include "kernels.h" // Include the header
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
 #include <iostream>
 #include <vector>
+#include <limits>
+#include <string>
+#include <cmath>
 #include <algorithm>
 #include <cstdlib>
 #include <cuda_runtime.h>
-
-#define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
-
-// simple CUDA error check
-#define CHECK_CUDA(call) do {                              \
-    cudaError_t err = (call);                              \
-    if (err != cudaSuccess) {                              \
-        std::cerr << "CUDA Error: " << cudaGetErrorString(err) \
-                  << " at " << __FILE__ << ":" << __LINE__ << "\n"; \
-        std::exit(1);                                      \
-    }                                                      \
-} while(0)
 
 __device__ const int circleX[16] =
     {0,1,2,3,3,3,2,1,0,-1,-2,-3,-3,-3,-2,-1};
@@ -28,12 +18,6 @@ __device__ const int circleY[16] =
 // ----------------------------------------------------
 // FAST KERNEL: score per pixel (best contiguous run length)
 // ----------------------------------------------------
-#define BLOCK_W 16
-#define BLOCK_H 16
-#define HALO 3
-// Shared memory dimensions: Block size + 3 pixels on each side
-#define SMEM_W (BLOCK_W + 2 * HALO)
-#define SMEM_H (BLOCK_H + 2 * HALO)
 
 // Device helper: Checks if a bitmask contains a run of 'len' consecutive 1s (circular)
 __device__ __forceinline__ bool has_circular_run(unsigned int mask, int len) {
@@ -142,10 +126,6 @@ __global__ void fastKernel(const unsigned char* __restrict__ in,
 // NMS KERNEL: keep only local maxima in a window
 // Input: score (uchar), Output: mask (uchar: 255 or 0)
 // ----------------------------------------------------
-#define NMS_SMEM_W (BLOCK_W + 2 * NMS_RADIUS)
-#define NMS_SMEM_H (BLOCK_H + 2 * NMS_RADIUS)
-#define NMS_WINDOW 5
-#define NMS_RADIUS 2
 
 __global__ void nmsKernel(const unsigned char* __restrict__ score, 
                                    unsigned char* __restrict__ out,
@@ -217,11 +197,8 @@ __global__ void nmsKernel(const unsigned char* __restrict__ score,
 // ------------------------------------------------------------
 // SOBEL KERNEL: compute Ix, Iy (float arrays)
 // ------------------------------------------------------------
-#define SOBEL_RADIUS 1
 
 // Shared memory dimensions: Block size + 2 * Radius (2*1 = 2)
-#define SOBEL_SMEM_W (BLOCK_W + 2 * SOBEL_RADIUS)
-#define SOBEL_SMEM_H (BLOCK_H + 2 * SOBEL_RADIUS)
 
 __global__ void sobelKernel(const unsigned char* __restrict__ in, 
                                   float* __restrict__ Ix, 
@@ -342,105 +319,303 @@ void harrisWindowKernel(const unsigned char* fastMask,
     harris[idx] = R;
 }
 
-// ------------------------------------------------------------
-// MAIN
-// ------------------------------------------------------------
-int main(int argc, char** argv)
+// =====================================================================
+// DEVICE HELPER FUNCTIONS
+// =====================================================================
+
+// Bilinear Interpolation for better Rotation Invariance
+__device__ float bilinearAt(const unsigned char* smem_patch, float x, float y, int patch_dim) {
+    int x1 = (int)x;
+    int y1 = (int)y;
+    int x2 = x1 + 1;
+    int y2 = y1 + 1;
+
+    // Strict bounds check relative to the shared memory patch
+    if (x1 < 0 || x2 >= patch_dim || y1 < 0 || y2 >= patch_dim) return 0.0f;
+
+    float p11 = smem_patch[y1 * patch_dim + x1];
+    float p12 = smem_patch[y1 * patch_dim + x2];
+    float p21 = smem_patch[y2 * patch_dim + x1];
+    float p22 = smem_patch[y2 * patch_dim + x2];
+
+    float wx = x - x1;
+    float wy = y - y1;
+
+    return (1.0f - wy) * ((1.0f - wx) * p11 + wx * p12) +
+           (wy) * ((1.0f - wx) * p21 + wx * p22);
+}
+
+__global__ 
+void gaussianBlur(const unsigned char* __restrict__ input, 
+                        unsigned char* __restrict__ output, 
+                        int width, int height) 
 {
-    if (argc < 5) {
-        std::cerr << "Usage: ./fast input.png output.png runThresh topN\n";
-        return 1;
+    // Shared memory cache
+    __shared__ unsigned char s_tile[BLUR_SMEM_DIM][BLUR_SMEM_DIM];
+
+    // Global coordinates
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int x = blockIdx.x * blockDim.x + tx;
+    int y = blockIdx.y * blockDim.y + ty;
+
+    // 1. LOAD DATA INTO SHARED MEMORY (Handle Halo)
+    // We need to load a 20x20 area using 16x16 threads.
+    // Some threads will load more than one pixel.
+    
+    // Top-left corner of the shared memory tile in global space
+    int tile_base_x = blockIdx.x * blockDim.x - BLUR_RADIUS;
+    int tile_base_y = blockIdx.y * blockDim.y - BLUR_RADIUS;
+
+    // Linearize loading to ensure all SMEM is filled
+    int thread_id_linear = ty * blockDim.x + tx;
+    int total_smem_pixels = BLUR_SMEM_DIM * BLUR_SMEM_DIM;
+
+    for (int i = thread_id_linear; i < total_smem_pixels; i += (blockDim.x * blockDim.y)) {
+        int smem_y = i / BLUR_SMEM_DIM;
+        int smem_x = i % BLUR_SMEM_DIM;
+
+        int global_x = tile_base_x + smem_x;
+        int global_y = tile_base_y + smem_y;
+
+        // Boundary Clamping (Safe Global Load)
+        global_x = max(0, min(global_x, width - 1));
+        global_y = max(0, min(global_y, height - 1));
+
+        s_tile[smem_y][smem_x] = input[global_y * width + global_x];
     }
 
-    const char* inputPath = argv[1];
-    const char* outputPath = argv[2];
-    int runThresh = std::atoi(argv[3]);
-    int topN = std::atoi(argv[4]);
+    __syncthreads(); // Wait for tile to load
 
-    int width, height, ch;
-    unsigned char* h_img = stbi_load(inputPath, &width, &height, &ch, 1);
-    if (!h_img) { std::cerr << "Failed to load " << inputPath << "\n"; return 1; }
+    // 2. COMPUTE CONVOLUTION
+    if (x < width && y < height) {
+        int kernel[5] = {1, 4, 6, 4, 1};
+        int sum = 0;
+        int weightSum = 256; // Precomputed sum of (1+4+6+4+1)^2
 
-    int imgSize = width * height;
+        // Loop relative to thread's position in SMEM
+        // The thread at tx, ty corresponds to s_tile[ty + RADIUS][tx + RADIUS]
+        for (int ky = -2; ky <= 2; ky++) {
+            for (int kx = -2; kx <= 2; kx++) {
+                int val = s_tile[ty + BLUR_RADIUS + ky][tx + BLUR_RADIUS + kx];
+                int w = kernel[ky + 2] * kernel[kx + 2];
+                sum += val * w;
+            }
+        }
+        output[y * width + x] = (unsigned char)(sum / weightSum);
+    }
+}
 
-    // Device buffers
-    unsigned char *d_in = nullptr, *d_score = nullptr, *d_nms = nullptr;
-    float *d_Ix = nullptr, *d_Iy = nullptr, *d_harris = nullptr;
+// =====================================================================
+// CUDA Kernel: ORB Descriptor
+// =====================================================================
+// Pattern constants
 
-    CHECK_CUDA(cudaMalloc(&d_in, imgSize));
-    CHECK_CUDA(cudaMalloc(&d_score, imgSize));
-    CHECK_CUDA(cudaMalloc(&d_nms, imgSize));
-    CHECK_CUDA(cudaMalloc(&d_Ix, imgSize * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_Iy, imgSize * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_harris, imgSize * sizeof(float)));
+__global__ void orbKernel(
+    const unsigned char* __restrict__ img,
+    const unsigned char* __restrict__ kp,
+    const int* __restrict__ pattern,
+    unsigned char* __restrict__ descriptors,
+    int width, int height)
+{
+    // --- 1. SHARED MEMORY ALLOCATION ---
+    // smem contains: [Pattern Array (constant)] [Image Patch (overwritten per kp)]
+    extern __shared__ int smem[]; 
+    int* s_pattern = smem; 
+    unsigned char* s_patch = (unsigned char*)&s_pattern[PATTERN_SIZE];
 
-    // init score & nms & harris to zero to avoid garbage at borders
-    CHECK_CUDA(cudaMemset(d_score, 0, imgSize));
-    CHECK_CUDA(cudaMemset(d_nms, 0, imgSize));
-    CHECK_CUDA(cudaMemset(d_harris, 0, imgSize * sizeof(float)));
+    int tid = threadIdx.x;
+    int global_idx = blockIdx.x * blockDim.x + tid;
+    
+    // --- 2. CACHE PATTERN (Collaborative Load) ---
+    // All threads help load the pattern once
+    for (int i = tid; i < PATTERN_SIZE; i += blockDim.x) {
+        s_pattern[i] = pattern[i];
+    }
+    __syncthreads();
 
-    // copy input
-    CHECK_CUDA(cudaMemcpy(d_in, h_img, imgSize, cudaMemcpyHostToDevice));
+    if (global_idx >= width * height) return;
 
-    dim3 threads(BLOCK_W,BLOCK_H);
-    dim3 blocks((width + BLOCK_W-1)/BLOCK_W, (height + BLOCK_H-1)/BLOCK_H);
+    // --- 3. WARP SCHEDULING ---
+    // Check if current thread has a keypoint
+    bool is_kp = (kp[global_idx] != 0);
 
-    int intensityThresh = 30;
-    // 1) FAST
-    fastKernel<<<blocks, threads>>>(d_in, d_score, width, height, intensityThresh, runThresh);
-    CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaDeviceSynchronize());
-
-    // 2) NMS (choose window 5 or 3)
-    nmsKernel<<<blocks, threads>>>(d_score, d_nms, width, height);
-    CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaDeviceSynchronize());
-
-    // 3) Sobel gradients
-    sobelKernel<<<blocks, threads>>>(d_in, d_Ix, d_Iy, width, height);
-    CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaDeviceSynchronize());
-
-    // 4) Harris using windowed sums (use window 3 or 5)
-    int harrisWindow = 3; // small window often used; try 3 or 5
-    float harrisK = 0.04f;
-    harrisWindowKernel<<<blocks, threads>>>(d_nms, d_Ix, d_Iy, d_harris, width, height, harrisWindow, harrisK);
-    CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaDeviceSynchronize());
-
-    // copy Harris back to host
-    std::vector<float> h_harris(imgSize);
-    CHECK_CUDA(cudaMemcpy(h_harris.data(), d_harris, imgSize * sizeof(float), cudaMemcpyDeviceToHost));
-
-    // gather >0 Harris responses into a vector (score, idx)
-    struct Corner { float score; int idx; };
-    std::vector<Corner> corners;
-    corners.reserve(1024);
-    for (int i = 0; i < imgSize; ++i) {
-        if (h_harris[i] > 0.0f) corners.push_back({h_harris[i], i});
+    // Boundary check (exclude borders)
+    int y = global_idx / width;
+    int x = global_idx % width;
+    const int BORDER = 24;
+    if (x < BORDER || x >= width - BORDER || y < BORDER || y >= height - BORDER) {
+        is_kp = false;
     }
 
-    // sort descending and keep topN
-    std::sort(corners.begin(), corners.end(), [](const Corner& a, const Corner& b){
-        return a.score > b.score;
-    });
-    if ((int)corners.size() > topN) corners.resize(topN);
+    // Leader Election: Who in this warp has work to do?
+    unsigned int active_mask = __ballot_sync(0xFFFFFFFF, is_kp);
+    int lane_id = tid % 32;
 
-    // build output mask
-    std::vector<unsigned char> out(imgSize, 0);
-    for (const auto &c : corners) out[c.idx] = 255;
+    while (active_mask != 0) {
+        // Select the leader (lowest active lane)
+        int leader_lane = __ffs(active_mask) - 1;
+        
+        // Broadcast leader's pixel index to everyone
+        int leader_idx = __shfl_sync(0xFFFFFFFF, global_idx, leader_lane);
+        int center_x = leader_idx % width;
+        int center_y = leader_idx / width;
 
-    stbi_write_png(outputPath, width, height, 1, out.data(), width);
+        // --- 4. LOAD PATCH TO SMEM (Collaborative) ---
+        int patch_base_x = center_x - PATCH_R;
+        int patch_base_y = center_y - PATCH_R;
 
-    // cleanup
-    CHECK_CUDA(cudaFree(d_in));
-    CHECK_CUDA(cudaFree(d_score));
-    CHECK_CUDA(cudaFree(d_nms));
-    CHECK_CUDA(cudaFree(d_Ix));
-    CHECK_CUDA(cudaFree(d_Iy));
-    CHECK_CUDA(cudaFree(d_harris));
-    stbi_image_free(h_img);
+        // Entire warp loads the 33x33 patch together
+        for (int i = lane_id; i < PATCH_DIM * PATCH_DIM; i += 32) {
+            int py = i / PATCH_DIM;
+            int px = i % PATCH_DIM;
+            // Safe Global Load
+            int src_idx = (patch_base_y + py) * width + (patch_base_x + px);
+            s_patch[py * PATCH_DIM + px] = img[src_idx];
+        }
+        __syncwarp(); // Wait for patch to load
 
-    std::cout << "Saved top " << corners.size() << " Harris-ranked FAST corners to " << outputPath << "\n";
-    return 0;
+        // --- 5. COMPUTE ORIENTATION (Parallel Reduction) ---
+        float local_m10 = 0, local_m01 = 0;
+        
+        for (int dy = -PATCH_R + lane_id; dy <= PATCH_R; dy += 32) {
+            for (int dx = -PATCH_R; dx <= PATCH_R; dx++) {
+                if (dx*dx + dy*dy > PATCH_R*PATCH_R) continue;
+                // Read from SMEM
+                unsigned char val = s_patch[(dy + PATCH_R) * PATCH_DIM + (dx + PATCH_R)];
+                local_m10 += dx * val;
+                local_m01 += dy * val;
+            }
+        }
+
+        // Reduce within warp
+        for (int offset = 16; offset > 0; offset /= 2) {
+            local_m10 += __shfl_down_sync(0xFFFFFFFF, local_m10, offset);
+            local_m01 += __shfl_down_sync(0xFFFFFFFF, local_m01, offset);
+        }
+        
+        float m10 = __shfl_sync(0xFFFFFFFF, local_m10, 0);
+        float m01 = __shfl_sync(0xFFFFFFFF, local_m01, 0);
+        
+        float angle = atan2f(m01, m10);
+        float ca, sa;
+        __sincosf(angle, &sa, &ca);
+
+        // --- 6. COMPUTE DESCRIPTOR (Parallel) ---
+        // Each thread calculates 1 Byte of the descriptor
+        if (lane_id < 32) {
+            unsigned char outByte = 0;
+            for (int bit = 0; bit < 8; bit++) {
+                int k = 8 * lane_id + bit;
+                
+                int px1 = s_pattern[k * 4 + 0];
+                int py1 = s_pattern[k * 4 + 1];
+                int px2 = s_pattern[k * 4 + 2];
+                int py2 = s_pattern[k * 4 + 3];
+
+                // Coordinates relative to SMEM patch center (PATCH_R, PATCH_R)
+                float rx1 = PATCH_R + (ca * px1 - sa * py1);
+                float ry1 = PATCH_R + (sa * px1 + ca * py1);
+                float rx2 = PATCH_R + (ca * px2 - sa * py2);
+                float ry2 = PATCH_R + (sa * px2 + ca * py2);
+
+                // Use the SMEM bilinear helper
+                float val1 = bilinearAt(s_patch, rx1, ry1, PATCH_DIM);
+                float val2 = bilinearAt(s_patch, rx2, ry2, PATCH_DIM);
+
+                if (val1 < val2) outByte |= (1 << bit);
+            }
+            // Write to Global Memory
+            descriptors[leader_idx * 32 + lane_id] = outByte;
+        }
+
+        // Done with this leader
+        active_mask &= ~(1 << leader_lane);
+    }
+}
+
+__global__ void matchKernel(const unsigned int* d_desc1,  // Image 1 Descriptors (Query)
+                 const unsigned int* d_desc2,  // Image 2 Descriptors (Train)
+                 MatchResult* d_matches,       // Output Array
+                 int numDesc1, 
+                 int numDesc2)
+{
+    // Each thread takes ONE descriptor from Image 1 and finds its best match in Image 2
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx >= numDesc1) return;
+
+    // 1. Load the Query Descriptor into Registers
+    // Descriptors are 32 bytes. That is 8 integers (4 bytes * 8 = 32).
+    // Storing this in local registers prevents reading global memory repeatedly.
+    unsigned int myDesc[8];
+    
+    // We assume the input pointer is treated as an array of ints.
+    // Stride is 8 ints per descriptor.
+    int myOffset = idx * 8;
+    
+    #pragma unroll
+    for (int k = 0; k < 8; k++) {
+        myDesc[k] = d_desc1[myOffset + k];
+    }
+
+    // Initialize best distances to max possible (256 bits)
+    int bestDist = 256;
+    int secondBestDist = 256; 
+    int bestIdx = -1;
+
+    // 2. Loop through ALL descriptors in Image 2 (Brute Force)
+    for (int j = 0; j < numDesc2; j++) {
+        
+        int dist = 0;
+        int otherOffset = j * 8;
+
+        // Compute Hamming Distance (XOR + Population Count)
+        // __popc is a hardware instruction that counts "1" bits instantly.
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            unsigned int other = d_desc2[otherOffset + k];
+            dist += __popc(myDesc[k] ^ other);
+        }
+
+        // 3. Track Best and Second Best (Logic for Lowe's Ratio Test)
+        if (dist < bestDist) {
+            secondBestDist = bestDist;
+            bestDist = dist;
+            bestIdx = j;
+        } else if (dist < secondBestDist) {
+            secondBestDist = dist;
+        }
+    }
+
+    // 4. Save result to global memory
+    d_matches[idx].trainIdx = bestIdx;
+    d_matches[idx].distance = bestDist;
+    d_matches[idx].secondDist = secondBestDist;
+}
+
+bool loadDescriptorFile(const char* fname, std::vector<unsigned int>& buffer) {
+    FILE* f = fopen(fname, "rb");
+    if (!f) {
+        std::cerr << "Error opening " << fname << "\n";
+        return false;
+    }
+    
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    rewind(f);
+
+    // Descriptor files are bytes (uint8), but we process them as ints (uint32).
+    // Size must be divisible by 4.
+    if (size % 4 != 0) {
+        std::cerr << "Error: File size not aligned to 4 bytes. Is this a valid descriptor file?\n";
+        fclose(f);
+        return false;
+    }
+
+    buffer.resize(size / 4); 
+    size_t read = fread(buffer.data(), 1, size, f);
+    fclose(f);
+    
+    return read == size;
 }

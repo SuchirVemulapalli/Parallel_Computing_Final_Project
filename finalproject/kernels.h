@@ -1,18 +1,83 @@
-#include <iostream>
-#include <vector>
-#include <cmath>
+#ifndef KERNELS_H
+#define KERNELS_H
+
 #include <cuda_runtime.h>
+#include <vector>
 
-#define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
+#define BLOCK_W 16
+#define BLOCK_H 16
+#define HALO 3
+// Shared memory dimensions: Block size + 3 pixels on each side
+#define SMEM_W (BLOCK_W + 2 * HALO)
+#define SMEM_H (BLOCK_H + 2 * HALO)
 
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
+#define NMS_SMEM_W (BLOCK_W + 2 * NMS_RADIUS)
+#define NMS_SMEM_H (BLOCK_H + 2 * NMS_RADIUS)
+#define NMS_WINDOW 5
+#define NMS_RADIUS 2
+#define SOBEL_RADIUS 1
 
-// =====================================================================
-// ORB PATTERN (Host Side)
-// We define this as a standard C array and copy it to GPU in main()
-// =====================================================================
+#define SOBEL_SMEM_W (BLOCK_W + 2 * SOBEL_RADIUS)
+#define SOBEL_SMEM_H (BLOCK_H + 2 * SOBEL_RADIUS)
+
+#define BLUR_BLOCK_DIM 16
+#define BLUR_RADIUS 2
+// The tile in shared memory must be larger than the block to handle the border
+#define BLUR_SMEM_DIM (BLUR_BLOCK_DIM + 2 * BLUR_RADIUS)
+
+//ORB kernel constants
+#define PATTERN_SIZE 1024 // 256 tests * 4 ints
+#define PATCH_R 16
+#define PATCH_DIM (2 * PATCH_R + 1) // 33 pixels
+
+struct MatchResult {
+    int trainIdx;      // Index of the matching feature in Image 2
+    int distance;      // Hamming distance of the best match
+    int secondDist;    // Hamming distance of the 2nd best match (for Ratio Test)
+    int padding;       // Unused, keeps struct size aligned
+};
+
+__device__ __forceinline__ bool has_circular_run(unsigned int mask, int len);
+
+__device__ float bilinearAt(const unsigned char* smem_patch, float x, float y, int patch_dim);
+
+__global__ void fastKernel(const unsigned char* __restrict__ in, 
+                        unsigned char* __restrict__ score,
+                        int width, int height, 
+                        int intensity_thresh, int run_thresh);
+
+__global__ void nmsKernel(const unsigned char* __restrict__ score, 
+                        unsigned char* __restrict__ out,
+                        int width, int height);
+
+__global__ void sobelKernel(const unsigned char* __restrict__ in, 
+                        float* __restrict__ Ix, 
+                        float* __restrict__ Iy, 
+                        int width, int height);
+
+__global__ void harrisWindowKernel(const unsigned char* fastMask,
+                        const float* Ix, const float* Iy,
+                        float* harris, int width, int height,
+                        int window, float k);
+
+__global__ void gaussianBlur(const unsigned char* __restrict__ input, 
+                        unsigned char* __restrict__ output, 
+                        int width, int height);
+
+__global__ void orbKernel(const unsigned char* __restrict__ img,
+                        const unsigned char* __restrict__ kp,
+                        const int* __restrict__ pattern,
+                        unsigned char* __restrict__ descriptors,
+                        int width, int height);
+
+__global__ void matchKernel(const unsigned int* d_desc1,  // Image 1 Descriptors (Query)
+                        const unsigned int* d_desc2,  // Image 2 Descriptors (Train)
+                        MatchResult* d_matches,       // Output Array
+                        int numDesc1, 
+                        int numDesc2);
+
+bool loadDescriptorFile(const char* fname, std::vector<unsigned int>& buffer);
+
 const int h_ORB_pattern[256*4] =
 {
     8,-3, 9,5/*mean (0), correlation (0)*/,
@@ -273,387 +338,4 @@ const int h_ORB_pattern[256*4] =
     -1,-6, 0,-11/*mean (0.127148), correlation (0.547401)*/
 };
 
-// =====================================================================
-// DEVICE HELPER FUNCTIONS
-// =====================================================================
-
-// Bilinear Interpolation for better Rotation Invariance
-__device__ float bilinearAt(const unsigned char* smem_patch, float x, float y, int patch_dim) {
-    int x1 = (int)x;
-    int y1 = (int)y;
-    int x2 = x1 + 1;
-    int y2 = y1 + 1;
-
-    // Strict bounds check relative to the shared memory patch
-    if (x1 < 0 || x2 >= patch_dim || y1 < 0 || y2 >= patch_dim) return 0.0f;
-
-    float p11 = smem_patch[y1 * patch_dim + x1];
-    float p12 = smem_patch[y1 * patch_dim + x2];
-    float p21 = smem_patch[y2 * patch_dim + x1];
-    float p22 = smem_patch[y2 * patch_dim + x2];
-
-    float wx = x - x1;
-    float wy = y - y1;
-
-    return (1.0f - wy) * ((1.0f - wx) * p11 + wx * p12) +
-           (wy) * ((1.0f - wx) * p21 + wx * p22);
-}
-
-// =====================================================================
-// CUDA Kernel: Gaussian Blur (5x5)
-// Helps remove noise so BRIEF descriptors are stable on flat textures
-// =====================================================================
-#define BLUR_BLOCK_DIM 16
-#define BLUR_RADIUS 2
-// The tile in shared memory must be larger than the block to handle the border
-#define BLUR_SMEM_DIM (BLUR_BLOCK_DIM + 2 * BLUR_RADIUS)
-
-__global__ 
-void gaussianBlur(const unsigned char* __restrict__ input, 
-                        unsigned char* __restrict__ output, 
-                        int width, int height) 
-{
-    // Shared memory cache
-    __shared__ unsigned char s_tile[BLUR_SMEM_DIM][BLUR_SMEM_DIM];
-
-    // Global coordinates
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-    int x = blockIdx.x * blockDim.x + tx;
-    int y = blockIdx.y * blockDim.y + ty;
-
-    // 1. LOAD DATA INTO SHARED MEMORY (Handle Halo)
-    // We need to load a 20x20 area using 16x16 threads.
-    // Some threads will load more than one pixel.
-    
-    // Top-left corner of the shared memory tile in global space
-    int tile_base_x = blockIdx.x * blockDim.x - BLUR_RADIUS;
-    int tile_base_y = blockIdx.y * blockDim.y - BLUR_RADIUS;
-
-    // Linearize loading to ensure all SMEM is filled
-    int thread_id_linear = ty * blockDim.x + tx;
-    int total_smem_pixels = BLUR_SMEM_DIM * BLUR_SMEM_DIM;
-
-    for (int i = thread_id_linear; i < total_smem_pixels; i += (blockDim.x * blockDim.y)) {
-        int smem_y = i / BLUR_SMEM_DIM;
-        int smem_x = i % BLUR_SMEM_DIM;
-
-        int global_x = tile_base_x + smem_x;
-        int global_y = tile_base_y + smem_y;
-
-        // Boundary Clamping (Safe Global Load)
-        global_x = max(0, min(global_x, width - 1));
-        global_y = max(0, min(global_y, height - 1));
-
-        s_tile[smem_y][smem_x] = input[global_y * width + global_x];
-    }
-
-    __syncthreads(); // Wait for tile to load
-
-    // 2. COMPUTE CONVOLUTION
-    if (x < width && y < height) {
-        int kernel[5] = {1, 4, 6, 4, 1};
-        int sum = 0;
-        int weightSum = 256; // Precomputed sum of (1+4+6+4+1)^2
-
-        // Loop relative to thread's position in SMEM
-        // The thread at tx, ty corresponds to s_tile[ty + RADIUS][tx + RADIUS]
-        for (int ky = -2; ky <= 2; ky++) {
-            for (int kx = -2; kx <= 2; kx++) {
-                int val = s_tile[ty + BLUR_RADIUS + ky][tx + BLUR_RADIUS + kx];
-                int w = kernel[ky + 2] * kernel[kx + 2];
-                sum += val * w;
-            }
-        }
-        output[y * width + x] = (unsigned char)(sum / weightSum);
-    }
-}
-
-// =====================================================================
-// CUDA Kernel: ORB Descriptor
-// =====================================================================
-// Pattern constants
-#define PATTERN_SIZE 1024 // 256 tests * 4 ints
-#define PATCH_R 16
-#define PATCH_DIM (2 * PATCH_R + 1) // 33 pixels
-
-__global__ void orbKernel(
-    const unsigned char* __restrict__ img,
-    const unsigned char* __restrict__ kp,
-    const int* __restrict__ pattern,
-    unsigned char* __restrict__ descriptors,
-    int width, int height)
-{
-    // --- 1. SHARED MEMORY ALLOCATION ---
-    // smem contains: [Pattern Array (constant)] [Image Patch (overwritten per kp)]
-    extern __shared__ int smem[]; 
-    int* s_pattern = smem; 
-    unsigned char* s_patch = (unsigned char*)&s_pattern[PATTERN_SIZE];
-
-    int tid = threadIdx.x;
-    int global_idx = blockIdx.x * blockDim.x + tid;
-    
-    // --- 2. CACHE PATTERN (Collaborative Load) ---
-    // All threads help load the pattern once
-    for (int i = tid; i < PATTERN_SIZE; i += blockDim.x) {
-        s_pattern[i] = pattern[i];
-    }
-    __syncthreads();
-
-    if (global_idx >= width * height) return;
-
-    // --- 3. WARP SCHEDULING ---
-    // Check if current thread has a keypoint
-    bool is_kp = (kp[global_idx] != 0);
-
-    // Boundary check (exclude borders)
-    int y = global_idx / width;
-    int x = global_idx % width;
-    const int BORDER = 24;
-    if (x < BORDER || x >= width - BORDER || y < BORDER || y >= height - BORDER) {
-        is_kp = false;
-    }
-
-    // Leader Election: Who in this warp has work to do?
-    unsigned int active_mask = __ballot_sync(0xFFFFFFFF, is_kp);
-    int lane_id = tid % 32;
-
-    while (active_mask != 0) {
-        // Select the leader (lowest active lane)
-        int leader_lane = __ffs(active_mask) - 1;
-        
-        // Broadcast leader's pixel index to everyone
-        int leader_idx = __shfl_sync(0xFFFFFFFF, global_idx, leader_lane);
-        int center_x = leader_idx % width;
-        int center_y = leader_idx / width;
-
-        // --- 4. LOAD PATCH TO SMEM (Collaborative) ---
-        int patch_base_x = center_x - PATCH_R;
-        int patch_base_y = center_y - PATCH_R;
-
-        // Entire warp loads the 33x33 patch together
-        for (int i = lane_id; i < PATCH_DIM * PATCH_DIM; i += 32) {
-            int py = i / PATCH_DIM;
-            int px = i % PATCH_DIM;
-            // Safe Global Load
-            int src_idx = (patch_base_y + py) * width + (patch_base_x + px);
-            s_patch[py * PATCH_DIM + px] = img[src_idx];
-        }
-        __syncwarp(); // Wait for patch to load
-
-        // --- 5. COMPUTE ORIENTATION (Parallel Reduction) ---
-        float local_m10 = 0, local_m01 = 0;
-        
-        for (int dy = -PATCH_R + lane_id; dy <= PATCH_R; dy += 32) {
-            for (int dx = -PATCH_R; dx <= PATCH_R; dx++) {
-                if (dx*dx + dy*dy > PATCH_R*PATCH_R) continue;
-                // Read from SMEM
-                unsigned char val = s_patch[(dy + PATCH_R) * PATCH_DIM + (dx + PATCH_R)];
-                local_m10 += dx * val;
-                local_m01 += dy * val;
-            }
-        }
-
-        // Reduce within warp
-        for (int offset = 16; offset > 0; offset /= 2) {
-            local_m10 += __shfl_down_sync(0xFFFFFFFF, local_m10, offset);
-            local_m01 += __shfl_down_sync(0xFFFFFFFF, local_m01, offset);
-        }
-        
-        float m10 = __shfl_sync(0xFFFFFFFF, local_m10, 0);
-        float m01 = __shfl_sync(0xFFFFFFFF, local_m01, 0);
-        
-        float angle = atan2f(m01, m10);
-        float ca, sa;
-        __sincosf(angle, &sa, &ca);
-
-        // --- 6. COMPUTE DESCRIPTOR (Parallel) ---
-        // Each thread calculates 1 Byte of the descriptor
-        if (lane_id < 32) {
-            unsigned char outByte = 0;
-            for (int bit = 0; bit < 8; bit++) {
-                int k = 8 * lane_id + bit;
-                
-                int px1 = s_pattern[k * 4 + 0];
-                int py1 = s_pattern[k * 4 + 1];
-                int px2 = s_pattern[k * 4 + 2];
-                int py2 = s_pattern[k * 4 + 3];
-
-                // Coordinates relative to SMEM patch center (PATCH_R, PATCH_R)
-                float rx1 = PATCH_R + (ca * px1 - sa * py1);
-                float ry1 = PATCH_R + (sa * px1 + ca * py1);
-                float rx2 = PATCH_R + (ca * px2 - sa * py2);
-                float ry2 = PATCH_R + (sa * px2 + ca * py2);
-
-                // Use the SMEM bilinear helper
-                float val1 = bilinearAt(s_patch, rx1, ry1, PATCH_DIM);
-                float val2 = bilinearAt(s_patch, rx2, ry2, PATCH_DIM);
-
-                if (val1 < val2) outByte |= (1 << bit);
-            }
-            // Write to Global Memory
-            descriptors[leader_idx * 32 + lane_id] = outByte;
-        }
-
-        // Done with this leader
-        active_mask &= ~(1 << leader_lane);
-    }
-}
-
-// =====================================================================
-// MAIN
-// =====================================================================
-int main(int argc, char** argv)
-{
-    if (argc < 5) {
-        std::cerr << "Usage: ./brief <img.png> <kp_mask.png> <out_desc.bin> <out_keypoints.bin>\n";
-        return 1;
-    }
-
-    const char* inputImg = argv[1];
-    const char* kpImg    = argv[2];
-    const char* outDesc  = argv[3];
-    const char* outKp    = argv[4];
-
-    int w1,h1,c1, w2,h2,c2;
-
-    // Load images
-    unsigned char* h_img = stbi_load(inputImg, &w1, &h1, &c1, 1);
-    unsigned char* h_kp  = stbi_load(kpImg,  &w2, &h2, &c2, 1);
-
-    if (!h_img || !h_kp) {
-        std::cerr << "Failed to load input images.\n";
-        return 1;
-    }
-
-    if (w1!=w2 || h1!=h2) {
-        std::cerr << "Dimension mismatch.\n";
-        return 1;
-    }
-
-    int imgSize = w1 * h1;
-
-    // GPU Allocations
-    unsigned char *d_img, *d_kp, *d_desc;
-    unsigned char *d_blurred; 
-    int *d_pattern;
-
-    cudaMalloc(&d_img, imgSize);
-    cudaMalloc(&d_blurred, imgSize);
-    cudaMalloc(&d_kp,  imgSize);
-    cudaMalloc(&d_desc, imgSize * 32);
-    cudaMalloc(&d_pattern, sizeof(h_ORB_pattern)); 
-
-    // Copy Data to GPU
-    cudaMemcpy(d_img, h_img, imgSize, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_kp,  h_kp,  imgSize, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_pattern, h_ORB_pattern, sizeof(h_ORB_pattern), cudaMemcpyHostToDevice);
-
-    // Initialize descriptors to 0
-    cudaMemset(d_desc, 0, imgSize * 32);
-
-    std::cout << "Applying Gaussian Blur..." << std::endl;
-
-    // =================================================================
-    // STEP 1: RUN GAUSSIAN BLUR (OPTIMIZED)
-    // =================================================================
-    dim3 blurBlock(16, 16);
-    dim3 blurGrid((w1 + 15) / 16, (h1 + 15) / 16);
-    
-    // Note: No dynamic smem size needed here (it is static in the kernel)
-    gaussianBlur<<<blurGrid, blurBlock>>>(d_img, d_blurred, w1, h1);
-    
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        std::cerr << "Blur Kernel Error: " << cudaGetErrorString(err) << "\n";
-        return 1;
-    }
-    cudaDeviceSynchronize();
-
-    std::cout << "Running ORB Kernel..." << std::endl;
-
-    // =================================================================
-    // STEP 2: RUN ORB KERNEL (OPTIMIZED WITH DYNAMIC SMEM)
-    // =================================================================
-    int threadsPerBlock = 256;
-    int blocksPerGrid = (imgSize + threadsPerBlock - 1) / threadsPerBlock;
-
-    // --- CRITICAL: Calculate Dynamic Shared Memory Size ---
-    // 1. Pattern Storage: 1024 integers
-    // 2. Patch Storage:   33 * 33 bytes (1089 bytes)
-    size_t smemSize = (1024 * sizeof(int)) + (33 * 33 * sizeof(unsigned char));
-
-    // Launch with 3rd argument: smemSize
-    orbKernel<<<blocksPerGrid, threadsPerBlock, smemSize>>>(
-        d_blurred, 
-        d_kp, 
-        d_pattern, 
-        d_desc, 
-        w1, h1
-    );
-    
-    err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) {
-        std::cerr << "ORB Kernel Error: " << cudaGetErrorString(err) << "\n";
-        return 1;
-    }
-
-    // Copy descriptors back to Host
-    std::vector<unsigned char> h_desc(imgSize * 32);
-    cudaMemcpy(h_desc.data(), d_desc, imgSize * 32, cudaMemcpyDeviceToHost);
-
-    // Save Logic (Descriptors + Keypoints)
-    FILE* f_desc = fopen(outDesc, "wb");
-    FILE* f_kp   = fopen(outKp,   "wb");
-
-    if (!f_desc || !f_kp) {
-        std::cerr << "Error opening output files for writing!\n";
-        return 1;
-    }
-
-    int count = 0;
-    // Must match the BORDER used in the kernel to avoid saving zeroed descriptors
-    const int HOST_BORDER = 24; 
-
-    for (int i=0; i<imgSize; i++) {
-        if (h_kp[i] == 255) {
-            
-            // Calculate X and Y on CPU
-            int px = i % w1;
-            int py = i / w1;
-
-            if (px < HOST_BORDER || px >= w1 - HOST_BORDER || 
-                py < HOST_BORDER || py >= h1 - HOST_BORDER) {
-                continue; 
-            }
-
-            // Write Descriptor
-            fwrite(&h_desc[i*32], 1, 32, f_desc);
-
-            // Write Coordinates
-            float kx = (float)(i % w1); 
-            float ky = (float)(i / w1);
-            fwrite(&kx, sizeof(float), 1, f_kp);
-            fwrite(&ky, sizeof(float), 1, f_kp);
-
-            count++;
-        }
-    }
-
-    fclose(f_desc);
-    fclose(f_kp);
-
-    std::cout << "Successfully saved " << count << " descriptors and keypoints.\n";
-
-    // Cleanup
-    cudaFree(d_img);
-    cudaFree(d_blurred);
-    cudaFree(d_kp);
-    cudaFree(d_desc);
-    cudaFree(d_pattern);
-
-    stbi_image_free(h_img);
-    stbi_image_free(h_kp);
-
-    return 0;
-}
+#endif
