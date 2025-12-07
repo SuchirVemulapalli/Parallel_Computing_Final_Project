@@ -207,7 +207,7 @@ __global__ void ransacKernel(const Point2f* srcPts, const Point2f* dstPts, int n
 // =====================================================================
 // DEVICE HELPER: Bilinear Interpolation (RGB Support)
 // =====================================================================
-__device__ float bilinearAt(const unsigned char* img, int w, int h, float x, float y, int c) {
+__device__ float bilinearAtStitcher(const unsigned char* img, int w, int h, float x, float y, int c) {
     int x1 = (int)x; int y1 = (int)y;
     int x2 = x1 + 1; int y2 = y1 + 1;
     if (x1 < 0 || x2 >= w || y1 < 0 || y2 >= h) return 0.0f;
@@ -245,9 +245,9 @@ __global__ void warpKernel(const unsigned char* src, unsigned char* dst,
 
     if (srcX >= 0 && srcX < srcW - 1 && srcY >= 0 && srcY < srcH - 1) {
         int dstIdx = (dstY * dstW + dstX) * 3;
-        dst[dstIdx + 0] = (unsigned char)bilinearAt(src, srcW, srcH, srcX, srcY, 0); // R
-        dst[dstIdx + 1] = (unsigned char)bilinearAt(src, srcW, srcH, srcX, srcY, 1); // G
-        dst[dstIdx + 2] = (unsigned char)bilinearAt(src, srcW, srcH, srcX, srcY, 2); // B
+        dst[dstIdx + 0] = (unsigned char)bilinearAtStitcher(src, srcW, srcH, srcX, srcY, 0); // R
+        dst[dstIdx + 1] = (unsigned char)bilinearAtStitcher(src, srcW, srcH, srcX, srcY, 1); // G
+        dst[dstIdx + 2] = (unsigned char)bilinearAtStitcher(src, srcW, srcH, srcX, srcY, 2); // B
     }
 }
 

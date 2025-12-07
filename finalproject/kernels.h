@@ -37,6 +37,61 @@ struct MatchResult {
     int padding;       // Unused, keeps struct size aligned
 };
 
+struct Point2f { float x; float y; };
+
+struct Mat3x3 {
+    float data[9]; // Row-major
+
+    static Mat3x3 identity() {
+        return {1,0,0, 0,1,0, 0,0,1};
+    }
+
+    // Matrix Multiplication (A * B)
+    Mat3x3 operator*(const Mat3x3& b) const {
+        Mat3x3 res;
+        for (int r = 0; r < 3; r++) {
+            for (int c = 0; c < 3; c++) {
+                res.data[r*3 + c] = 
+                    data[r*3 + 0] * b.data[0*3 + c] +
+                    data[r*3 + 1] * b.data[1*3 + c] +
+                    data[r*3 + 2] * b.data[2*3 + c];
+            }
+        }
+        return res;
+    }
+
+    // Transform a Point (Perspective Division)
+    Point2f transform(Point2f p) const {
+        float x = p.x;
+        float y = p.y;
+        float Z = data[6]*x + data[7]*y + data[8];
+        return { (data[0]*x + data[1]*y + data[2]) / Z, 
+                 (data[3]*x + data[4]*y + data[5]) / Z };
+    }
+
+    // Invert 3x3 Matrix
+    Mat3x3 inverse() const {
+        float det = data[0] * (data[4] * data[8] - data[7] * data[5]) -
+                    data[1] * (data[3] * data[8] - data[5] * data[6]) +
+                    data[2] * (data[3] * data[7] - data[4] * data[6]);
+
+        if (std::abs(det) < 1e-7) return identity(); 
+
+        float invDet = 1.0f / det;
+        Mat3x3 res;
+        res.data[0] = (data[4] * data[8] - data[5] * data[7]) * invDet;
+        res.data[1] = (data[2] * data[7] - data[1] * data[8]) * invDet;
+        res.data[2] = (data[1] * data[5] - data[2] * data[4]) * invDet;
+        res.data[3] = (data[5] * data[6] - data[3] * data[8]) * invDet;
+        res.data[4] = (data[0] * data[8] - data[2] * data[6]) * invDet;
+        res.data[5] = (data[2] * data[3] - data[0] * data[5]) * invDet;
+        res.data[6] = (data[3] * data[7] - data[4] * data[6]) * invDet;
+        res.data[7] = (data[1] * data[6] - data[0] * data[7]) * invDet;
+        res.data[8] = (data[0] * data[4] - data[1] * data[3]) * invDet;
+        return res;
+    }
+};
+
 __device__ __forceinline__ bool has_circular_run(unsigned int mask, int len);
 
 __device__ float bilinearAt(const unsigned char* smem_patch, float x, float y, int patch_dim);
@@ -77,6 +132,25 @@ __global__ void matchKernel(const unsigned int* d_desc1,  // Image 1 Descriptors
                         int numDesc2);
 
 bool loadDescriptorFile(const char* fname, std::vector<unsigned int>& buffer);
+
+void normalizePoints(const std::vector<Point2f>& in, std::vector<Point2f>& out, Mat3x3& T);
+
+__device__ unsigned int xorshift(unsigned int& state);
+
+__device__ bool solveHomography8x8(float A[8][9], float h[9]);
+
+__global__ void ransacKernel(const Point2f* srcPts, const Point2f* dstPts, int numMatches,
+                        float* bestH, int* maxInliers, 
+                        int numIterations, float threshold);
+
+__device__ float bilinearAtStitcher(const unsigned char* img, int w, int h, float x, float y, int c);
+
+__global__ void warpKernel(const unsigned char* src, unsigned char* dst, 
+                        int srcW, int srcH, int dstW, int dstH,
+                        const float* h_inv, int offsetX, int offsetY);
+
+__global__ void pasteKernel(const unsigned char* src, unsigned char* dst, 
+                        int srcW, int srcH, int dstW, int dstH, int offsetX, int offsetY);
 
 const int h_ORB_pattern[256*4] =
 {
