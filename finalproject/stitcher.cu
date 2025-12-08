@@ -276,7 +276,7 @@ __global__ void pasteKernel(const unsigned char* __restrict__ src,
 // =====================================================================
 int main(int argc, char** argv) {
     if (argc < 7) {
-        std::cerr << "Usage: " << argv[0] << " <img1> <img2> <kp1> <kp2> <matches> <output.jpg>\n";
+        std::cerr << "Usage: " << argv[0] << " <img1.png> <img2.png> <kp1.bin> <kp2.bin> <matches.bin> <output.png>\n";
         return 1;
     }
 
