@@ -9,7 +9,6 @@
 
 // =====================================================================
 // KERNEL: RGB to Grayscale
-// Uses the standard Luminosity Formula: Y = 0.299*R + 0.587*G + 0.114*B
 // =====================================================================
 __global__ 
 void rgbToGrayKernel(const unsigned char* rgb, unsigned char* gray, int width, int height) {
@@ -28,7 +27,6 @@ void rgbToGrayKernel(const unsigned char* rgb, unsigned char* gray, int width, i
     float b = rgb[rgb_idx + 2];
 
     // Compute luminance
-    // We use floats for precision, then cast back to char
     unsigned char val = (unsigned char)(0.299f * r + 0.587f * g + 0.114f * b);
 
     gray[idx] = val;
@@ -46,7 +44,7 @@ int main(int argc, char** argv) {
     const char* inputFile = argv[1];
     const char* outputFile = argv[2];
 
-    // 1. Load Image in COLOR (Force 3 channels)
+    // Load Image in COLOR
     int width, height, channels;
     unsigned char* h_rgb = stbi_load(inputFile, &width, &height, &channels, 3);
 
@@ -58,7 +56,7 @@ int main(int argc, char** argv) {
     int numPixels = width * height;
     std::cout << "Loaded Image: " << width << "x" << height << " (RGB)\n";
 
-    // 2. Allocate GPU Memory
+    // Allocate GPU Memory
     unsigned char *d_rgb, *d_gray;
     
     // Allocate RGB buffer (Size * 3)
@@ -66,22 +64,20 @@ int main(int argc, char** argv) {
     // Allocate Grayscale buffer (Size * 1)
     cudaMalloc(&d_gray, numPixels);
 
-    // 3. Copy RGB to GPU
+    // Copy RGB to GPU
     cudaMemcpy(d_rgb, h_rgb, numPixels * 3, cudaMemcpyHostToDevice);
 
-    // 4. Launch Kernel
+    // Launch Kernel
     dim3 threads(16, 16);
     dim3 blocks((width + 15) / 16, (height + 15) / 16);
 
     rgbToGrayKernel<<<blocks, threads>>>(d_rgb, d_gray, width, height);
     cudaDeviceSynchronize();
 
-    // 5. Download Grayscale Result
-    // We reuse the host buffer or allocate a new one. Let's make a new one.
+    // Download Grayscale Result
     std::vector<unsigned char> h_gray(numPixels);
     cudaMemcpy(h_gray.data(), d_gray, numPixels, cudaMemcpyDeviceToHost);
 
-    // 6. Save Result (1 Channel)
     stbi_write_jpg(outputFile, width, height, 1, h_gray.data(), 100);
 
     std::cout << "Saved grayscale image to " << outputFile << "\n";

@@ -322,9 +322,7 @@ void gaussianBlur(const unsigned char* __restrict__ input,
     int x = blockIdx.x * blockDim.x + tx;
     int y = blockIdx.y * blockDim.y + ty;
 
-    // 1. LOAD DATA INTO SHARED MEMORY (Handle Halo)
-    // We need to load a 20x20 area using 16x16 threads.
-    // Some threads will load more than one pixel.
+    // Load data into shared memory
     
     // Top-left corner of the shared memory tile in global space
     int tile_base_x = blockIdx.x * blockDim.x - BLUR_RADIUS;
@@ -341,7 +339,7 @@ void gaussianBlur(const unsigned char* __restrict__ input,
         int global_x = tile_base_x + smem_x;
         int global_y = tile_base_y + smem_y;
 
-        // Boundary Clamping (Safe Global Load)
+        // Boundary Clamping 
         global_x = max(0, min(global_x, width - 1));
         global_y = max(0, min(global_y, height - 1));
 
@@ -350,14 +348,13 @@ void gaussianBlur(const unsigned char* __restrict__ input,
 
     __syncthreads(); // Wait for tile to load
 
-    // 2. COMPUTE CONVOLUTION
+    // Compute convolution
     if (x < width && y < height) {
         int kernel[5] = {1, 4, 6, 4, 1};
         int sum = 0;
-        int weightSum = 256; // Precomputed sum of (1+4+6+4+1)^2
+        int weightSum = 256; 
 
         // Loop relative to thread's position in SMEM
-        // The thread at tx, ty corresponds to s_tile[ty + RADIUS][tx + RADIUS]
         for (int ky = -2; ky <= 2; ky++) {
             for (int kx = -2; kx <= 2; kx++) {
                 int val = s_tile[ty + BLUR_RADIUS + ky][tx + BLUR_RADIUS + kx];
@@ -372,10 +369,9 @@ void gaussianBlur(const unsigned char* __restrict__ input,
 // =====================================================================
 // CUDA Kernel: ORB Descriptor
 // =====================================================================
-// Pattern constants
-#define PATTERN_SIZE 1024 // 256 tests * 4 ints
+#define PATTERN_SIZE 1024 
 #define PATCH_R 16
-#define PATCH_DIM (2 * PATCH_R + 1) // 33 pixels
+#define PATCH_DIM (2 * PATCH_R + 1) 
 
 __global__ void orbKernel(
     const unsigned char* __restrict__ img,
@@ -384,16 +380,14 @@ __global__ void orbKernel(
     unsigned char* __restrict__ descriptors,
     int width, int height)
 {
-    // --- 1. SHARED MEMORY ALLOCATION ---
-    // smem contains: [Pattern Array (constant)] [Image Patch (overwritten per kp)]
+    // Shared Memory allocation
     extern __shared__ int smem[]; 
     int* s_pattern = smem; 
     unsigned char* s_patch = (unsigned char*)&s_pattern[PATTERN_SIZE];
 
     int tid = threadIdx.x;
     int global_idx = blockIdx.x * blockDim.x + tid;
-    
-    // --- 2. CACHE PATTERN (Collaborative Load) ---
+
     // All threads help load the pattern once
     for (int i = tid; i < PATTERN_SIZE; i += blockDim.x) {
         s_pattern[i] = pattern[i];
@@ -402,7 +396,6 @@ __global__ void orbKernel(
 
     if (global_idx >= width * height) return;
 
-    // --- 3. WARP SCHEDULING ---
     // Check if current thread has a keypoint
     bool is_kp = (kp[global_idx] != 0);
 
@@ -427,7 +420,6 @@ __global__ void orbKernel(
         int center_x = leader_idx % width;
         int center_y = leader_idx / width;
 
-        // --- 4. LOAD PATCH TO SMEM (Collaborative) ---
         int patch_base_x = center_x - PATCH_R;
         int patch_base_y = center_y - PATCH_R;
 
@@ -435,19 +427,18 @@ __global__ void orbKernel(
         for (int i = lane_id; i < PATCH_DIM * PATCH_DIM; i += 32) {
             int py = i / PATCH_DIM;
             int px = i % PATCH_DIM;
-            // Safe Global Load
             int src_idx = (patch_base_y + py) * width + (patch_base_x + px);
             s_patch[py * PATCH_DIM + px] = img[src_idx];
         }
         __syncwarp(); // Wait for patch to load
 
-        // --- 5. COMPUTE ORIENTATION (Parallel Reduction) ---
+        // Compute orientation
         float local_m10 = 0, local_m01 = 0;
         
         for (int dy = -PATCH_R + lane_id; dy <= PATCH_R; dy += 32) {
             for (int dx = -PATCH_R; dx <= PATCH_R; dx++) {
                 if (dx*dx + dy*dy > PATCH_R*PATCH_R) continue;
-                // Read from SMEM
+                // Read from shared memory
                 unsigned char val = s_patch[(dy + PATCH_R) * PATCH_DIM + (dx + PATCH_R)];
                 local_m10 += dx * val;
                 local_m01 += dy * val;
@@ -467,7 +458,6 @@ __global__ void orbKernel(
         float ca, sa;
         __sincosf(angle, &sa, &ca);
 
-        // --- 6. COMPUTE DESCRIPTOR (Parallel) ---
         // Each thread calculates 1 Byte of the descriptor
         if (lane_id < 32) {
             unsigned char outByte = 0;
@@ -479,7 +469,7 @@ __global__ void orbKernel(
                 int px2 = s_pattern[k * 4 + 2];
                 int py2 = s_pattern[k * 4 + 3];
 
-                // Coordinates relative to SMEM patch center (PATCH_R, PATCH_R)
+                // Coordinates relative to SMEM patch center
                 float rx1 = PATCH_R + (ca * px1 - sa * py1);
                 float ry1 = PATCH_R + (sa * px1 + ca * py1);
                 float rx2 = PATCH_R + (ca * px2 - sa * py2);
@@ -554,9 +544,7 @@ int main(int argc, char** argv)
 
     std::cout << "Applying Gaussian Blur..." << std::endl;
 
-    // =================================================================
-    // STEP 1: RUN GAUSSIAN BLUR (OPTIMIZED)
-    // =================================================================
+
     dim3 blurBlock(16, 16);
     dim3 blurGrid((w1 + 15) / 16, (h1 + 15) / 16);
     
@@ -572,18 +560,13 @@ int main(int argc, char** argv)
 
     std::cout << "Running ORB Kernel..." << std::endl;
 
-    // =================================================================
-    // STEP 2: RUN ORB KERNEL (OPTIMIZED WITH DYNAMIC SMEM)
-    // =================================================================
+
     int threadsPerBlock = 256;
     int blocksPerGrid = (imgSize + threadsPerBlock - 1) / threadsPerBlock;
 
-    // --- CRITICAL: Calculate Dynamic Shared Memory Size ---
-    // 1. Pattern Storage: 1024 integers
-    // 2. Patch Storage:   33 * 33 bytes (1089 bytes)
+
     size_t smemSize = (1024 * sizeof(int)) + (33 * 33 * sizeof(unsigned char));
 
-    // Launch with 3rd argument: smemSize
     orbKernel<<<blocksPerGrid, threadsPerBlock, smemSize>>>(
         d_blurred, 
         d_kp, 
@@ -598,7 +581,6 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // Copy descriptors back to Host
     std::vector<unsigned char> h_desc(imgSize * 32);
     cudaMemcpy(h_desc.data(), d_desc, imgSize * 32, cudaMemcpyDeviceToHost);
 

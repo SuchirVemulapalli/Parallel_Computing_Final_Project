@@ -1,4 +1,3 @@
-// fast_harris_topN.cu
 #include <iostream>
 #include <vector>
 #include <algorithm>
@@ -26,7 +25,7 @@ __device__ const int circleY[16] =
     {-3,-3,-2,-1,0,1,2,3,3,3,2,1,0,-1,-2,-3};
 
 // ----------------------------------------------------
-// FAST KERNEL: score per pixel (best contiguous run length)
+// FAST KERNEL: score per pixel 
 // ----------------------------------------------------
 #define BLOCK_W 16
 #define BLOCK_H 16
@@ -35,10 +34,8 @@ __device__ const int circleY[16] =
 #define SMEM_W (BLOCK_W + 2 * HALO)
 #define SMEM_H (BLOCK_H + 2 * HALO)
 
-// Device helper: Checks if a bitmask contains a run of 'len' consecutive 1s (circular)
+// Device helper: Checks if a bitmask contains a run of 'len' consecutive 1s 
 __device__ __forceinline__ bool has_circular_run(unsigned int mask, int len) {
-    // Duplicate the mask to handle the "wrap around" (e.g., run crossing index 15->0)
-    // 0000...1111111111111111 (16 bits) -> becomes 32 bits with wrap
     unsigned int extended = mask | (mask << 16);
     unsigned int res = extended;
     for (int i = 1; i < len; i++) {
@@ -52,7 +49,7 @@ __global__ void fastKernel(const unsigned char* __restrict__ in,
                                      int width, int height, 
                                      int intensity_thresh, int run_thresh)
 {
-    // 1. Setup Shared Memory
+    // Setup Shared Memory
     __shared__ unsigned char smem[SMEM_H][SMEM_W];
 
     int tid = threadIdx.y * blockDim.x + threadIdx.x;
@@ -60,7 +57,7 @@ __global__ void fastKernel(const unsigned char* __restrict__ in,
     int tile_base_x = blockIdx.x * blockDim.x - HALO;
     int tile_base_y = blockIdx.y * blockDim.y - HALO;
 
-    // 2. Cooperative Load (Unchanged - maximizes memory throughput)
+    // Cooperative Load 
     for (int i = tid; i < SMEM_H * SMEM_W; i += blockSize) {
         int smem_y = i / SMEM_W;
         int smem_x = i % SMEM_W;
@@ -76,7 +73,7 @@ __global__ void fastKernel(const unsigned char* __restrict__ in,
 
     __syncthreads();
 
-    // 3. Setup Coordinates
+    // Setup Coordinates
     int gx = blockIdx.x * blockDim.x + threadIdx.x;
     int gy = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -87,19 +84,14 @@ __global__ void fastKernel(const unsigned char* __restrict__ in,
     int sy = threadIdx.y + HALO;
     int center = smem[sy][sx];
 
-    // 4. Branchless Ring Check (Optimized for Warp Scheduler)
-    // We execute the exact same instructions for every pixel (no divergence).
     
     unsigned int mask_bright = 0;
     unsigned int mask_dark = 0;
 
-    // Unroll the loop fully. The compiler converts this to independent load instructions.
-    // The Warp Scheduler can issue these loads back-to-back, hiding latency perfectly.
     #pragma unroll
     for (int k = 0; k < 16; ++k) {
         int neighbor = smem[sy + circleY[k]][sx + circleX[k]];
-        
-        // Predicated execution (no branches)
+
         // If neighbor is brighter, set the k-th bit
         if (neighbor > center + intensity_thresh) mask_bright |= (1u << k);
         
@@ -107,26 +99,17 @@ __global__ void fastKernel(const unsigned char* __restrict__ in,
         if (neighbor < center - intensity_thresh) mask_dark |= (1u << k);
     }
 
-    // 5. Evaluate Runs using Bitwise Logic
-    // This replaces the nested if/else logic with pure ALU operations
+
     int final_score = 0;
 
-    // Optimization: Popcount check
-    // If total set bits < threshold, it is mathematically impossible to have a contiguous run.
-    // __popc is a single hardware instruction.
     if (__popc(mask_bright) >= run_thresh) {
         if (has_circular_run(mask_bright, run_thresh)) {
-            // Calculate score (sum of diffs or just max length? FAST usually uses Sum of Absolute Diff)
-            // For this specific request, we just need to return a non-zero score.
-            // Let's return the run length (conceptually) or a fixed value. 
-            // The original kernel returned 'maxB'. We can approximate or recalculate if needed.
-            // For speed, often just 255 or the bit count is used.
-            // Let's stick to the original logic: return maxB (approximated by popcount or just valid)
+            // Calculate score 
             final_score = __popc(mask_bright); 
         }
     }
     
-    // Only check dark if bright didn't trigger (FAST implies a corner is EITHER bright OR dark, rarely both)
+    // Only check dark if bright didn't trigger 
     if (final_score == 0 && __popc(mask_dark) >= run_thresh) {
         if (has_circular_run(mask_dark, run_thresh)) {
             final_score = __popc(mask_dark);
@@ -140,7 +123,6 @@ __global__ void fastKernel(const unsigned char* __restrict__ in,
 
 // ----------------------------------------------------
 // NMS KERNEL: keep only local maxima in a window
-// Input: score (uchar), Output: mask (uchar: 255 or 0)
 // ----------------------------------------------------
 #define NMS_SMEM_W (BLOCK_W + 2 * NMS_RADIUS)
 #define NMS_SMEM_H (BLOCK_H + 2 * NMS_RADIUS)
@@ -151,8 +133,7 @@ __global__ void nmsKernel(const unsigned char* __restrict__ score,
                                    unsigned char* __restrict__ out,
                                    int width, int height)
 {
-    // 1. Static Shared Memory Setup
-    // Size is known at compile time, allocated automatically by CUDA
+    // Shared Memory Setup
     __shared__ unsigned char smem[NMS_SMEM_H][NMS_SMEM_W];
     // Global pixel coordinates
     int gx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -160,10 +141,10 @@ __global__ void nmsKernel(const unsigned char* __restrict__ score,
     // Linear thread ID for cooperative loading
     int tid = threadIdx.y * blockDim.x + threadIdx.x;
     int blockSize = blockDim.x * blockDim.y;
-    // Top-left of the tile in Global Memory (including the halo/apron)
+    // Top-left of the tile in Global Memory
     int tile_base_x = blockIdx.x * blockDim.x - NMS_RADIUS;
     int tile_base_y = blockIdx.y * blockDim.y - NMS_RADIUS;
-    // 2. Cooperative Global -> Shared Load (Warp Scheduling Optimization)
+
     // Threads cooperate to load the SMEM_W x SMEM_H area
     int total_smem_pixels = NMS_SMEM_W * NMS_SMEM_H;
     for (int i = tid; i < total_smem_pixels; i += blockSize) {
@@ -174,25 +155,25 @@ __global__ void nmsKernel(const unsigned char* __restrict__ score,
         int global_x = tile_base_x + local_x;
 
         unsigned char val = 0;
-        // Boundary check
         if (global_x >= 0 && global_x < width && global_y >= 0 && global_y < height) {
             val = score[global_y * width + global_x];
         }
-        smem[local_y][local_x] = val; // Store in static shared memory
+        smem[local_y][local_x] = val; 
     }
     __syncthreads(); // Wait for the tile to be fully loaded
 
-    // Early exit for threads outside the valid computation area (boundaries and padding)
+    // Early exit for threads outside the valid computation area
     if (gx < NMS_RADIUS || gx >= width - NMS_RADIUS || gy < NMS_RADIUS || gy >= height - NMS_RADIUS ||
         threadIdx.x >= BLOCK_W || threadIdx.y >= BLOCK_H) 
     {
         if (gx < width && gy < height) out[gy * width + gx] = 0;
         return;
     }
-    // Center coordinates in Shared Memory (offset by NMS_RADIUS)
+    // Center coordinates in Shared Memory
     int smem_cx = threadIdx.x + NMS_RADIUS;
     int smem_cy = threadIdx.y + NMS_RADIUS;
     unsigned char center_val = smem[smem_cy][smem_cx];
+
     // Early exit for background pixels
     if (center_val == 0) {
         out[gy * width + gx] = 0;
@@ -228,8 +209,7 @@ __global__ void sobelKernel(const unsigned char* __restrict__ in,
                                   float* __restrict__ Iy, 
                                   int width, int height)
 {
-    // 1. Static Shared Memory Setup
-    // Stores the input image data (unsigned char) for fast access
+    // Shared Memory Setup
     __shared__ unsigned char smem[SOBEL_SMEM_H][SOBEL_SMEM_W];
 
     // Global coordinates
@@ -245,8 +225,7 @@ __global__ void sobelKernel(const unsigned char* __restrict__ in,
     int tile_base_x = blockIdx.x * blockDim.x - SOBEL_RADIUS;
     int tile_base_y = blockIdx.y * blockDim.y - SOBEL_RADIUS;
     
-    // 2. Cooperative Global -> Shared Load (Warp Scheduling Optimization)
-    // This process ensures coalesced global memory access, maximizing throughput.
+
     int total_smem_pixels = SOBEL_SMEM_W * SOBEL_SMEM_H;
     
     for (int i = tid; i < total_smem_pixels; i += blockSize) {
@@ -257,16 +236,16 @@ __global__ void sobelKernel(const unsigned char* __restrict__ in,
         int global_x = tile_base_x + local_x;
 
         unsigned char val = 0;
-        // Boundary check (Handle image borders)
+
         if (global_x >= 0 && global_x < width && global_y >= 0 && global_y < height) {
             val = in[global_y * width + global_x];
         }
-        smem[local_y][local_x] = val; // Store in shared memory
+        smem[local_y][local_x] = val; 
     }
 
     __syncthreads(); // Wait for the tile to be fully loaded
 
-    // 3. Compute Sobel Gradient (using Shared Memory)
+    // Compute Sobel Gradient (using Shared Memory)
     
     // Early exit for threads computing outside the valid image boundaries
     if (gx <= 0 || gx >= width - 1 || gy <= 0 || gy >= height - 1 ||
@@ -285,7 +264,6 @@ __global__ void sobelKernel(const unsigned char* __restrict__ in,
     int smem_cy = threadIdx.y + SOBEL_RADIUS;
     
     // Sobel Gx Calculation
-    // Readings are now fast, low-latency accesses from shared memory
     float sx =
         -smem[smem_cy-1][smem_cx-1] + smem[smem_cy-1][smem_cx+1] -2.0f*smem[smem_cy][smem_cx-1] 
         + 2.0f*smem[smem_cy][smem_cx+1] -smem[smem_cy+1][smem_cx-1] + smem[smem_cy+1][smem_cx+1];
@@ -302,7 +280,6 @@ __global__ void sobelKernel(const unsigned char* __restrict__ in,
 
 // ------------------------------------------------------------
 // HARRIS KERNEL: compute windowed sums Sxx, Syy, Sxy and R
-// Only evaluate at locations where fastMask != 0
 // ------------------------------------------------------------
 __global__
 void harrisWindowKernel(const unsigned char* fastMask,
@@ -320,10 +297,10 @@ void harrisWindowKernel(const unsigned char* fastMask,
     int r = window/2;
     float Sxx = 0.0f, Syy = 0.0f, Sxy = 0.0f;
 
-    // sum products over window (small window: 3x3 or 5x5)
+    // sum products over window
     for (int dy = -r; dy <= r; ++dy) {
         int ny = y + dy;
-        if (ny < 1 || ny >= height-1) continue; // skip borders where sobel invalid
+        if (ny < 1 || ny >= height-1) continue; 
         for (int dx = -r; dx <= r; ++dx) {
             int nx = x + dx;
             if (nx < 1 || nx >= width-1) continue;
@@ -386,23 +363,23 @@ int main(int argc, char** argv)
     dim3 blocks((width + BLOCK_W-1)/BLOCK_W, (height + BLOCK_H-1)/BLOCK_H);
 
     int intensityThresh = 30;
-    // 1) FAST
+    // FAST
     fastKernel<<<blocks, threads>>>(d_in, d_score, width, height, intensityThresh, runThresh);
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
 
-    // 2) NMS (choose window 5 or 3)
+    // NMS 
     nmsKernel<<<blocks, threads>>>(d_score, d_nms, width, height);
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
 
-    // 3) Sobel gradients
+    // Sobel gradients
     sobelKernel<<<blocks, threads>>>(d_in, d_Ix, d_Iy, width, height);
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
 
-    // 4) Harris using windowed sums (use window 3 or 5)
-    int harrisWindow = 3; // small window often used; try 3 or 5
+    // Harris using windowed sums 
+    int harrisWindow = 3; 
     float harrisK = 0.04f;
     harrisWindowKernel<<<blocks, threads>>>(d_nms, d_Ix, d_Iy, d_harris, width, height, harrisWindow, harrisK);
     CHECK_CUDA(cudaGetLastError());

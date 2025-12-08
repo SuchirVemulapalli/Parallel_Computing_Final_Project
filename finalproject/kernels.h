@@ -60,7 +60,7 @@ struct Mat3x3 {
         return res;
     }
 
-    // Transform a Point (Perspective Division)
+    // Transform a Point 
     Point2f transform(Point2f p) const {
         float x = p.x;
         float y = p.y;
@@ -125,9 +125,9 @@ __global__ void orbKernel(const unsigned char* __restrict__ img,
                         unsigned char* __restrict__ descriptors,
                         int width, int height);
 
-__global__ void matchKernel(const unsigned int* d_desc1,  // Image 1 Descriptors (Query)
-                        const unsigned int* d_desc2,  // Image 2 Descriptors (Train)
-                        MatchResult* d_matches,       // Output Array
+__global__ void matchKernel(const unsigned int* d_desc1,  
+                        const unsigned int* d_desc2,  
+                        MatchResult* d_matches,      
                         int numDesc1, 
                         int numDesc2);
 
@@ -139,15 +139,21 @@ __device__ unsigned int xorshift(unsigned int& state);
 
 __device__ bool solveHomography8x8(float A[8][9], float h[9]);
 
-__global__ void ransacKernel(const Point2f* srcPts, const Point2f* dstPts, int numMatches,
-                        float* bestH, int* maxInliers, 
-                        int numIterations, float threshold);
+__global__ void ransacBlockKernel(const Point2f* __restrict__ srcPts, 
+                                  const Point2f* __restrict__ dstPts, 
+                                  int numMatches,
+                                  float* __restrict__ bestH, 
+                                  int* __restrict__ maxInliers, 
+                                  int* __restrict__ mutex, 
+                                  float threshold);
+
+__global__ void warpTextureKernel(cudaTextureObject_t texObj, 
+                                  unsigned char* __restrict__ dst, 
+                                  int dstW, int dstH,
+                                  const float* __restrict__ h_inv, 
+                                  int offsetX, int offsetY);
 
 __device__ float bilinearAtStitcher(const unsigned char* img, int w, int h, float x, float y, int c);
-
-__global__ void warpKernel(const unsigned char* src, unsigned char* dst, 
-                        int srcW, int srcH, int dstW, int dstH,
-                        const float* h_inv, int offsetX, int offsetY);
 
 __global__ void pasteKernel(const unsigned char* src, unsigned char* dst, 
                         int srcW, int srcH, int dstW, int dstH, int offsetX, int offsetY);

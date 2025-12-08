@@ -55,7 +55,7 @@ void getFeatures(const char* inputPath, int topN) {
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
 
-    // 2) NMS (choose window 5 or 3)
+    // 2) NMS 
     nmsKernel<<<blocks, threads>>>(d_score, d_nms, width, height);
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
@@ -65,8 +65,8 @@ void getFeatures(const char* inputPath, int topN) {
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
 
-    // 4) Harris using windowed sums (use window 3 or 5)
-    int harrisWindow = 3; // small window often used; try 3 or 5
+    // 4) Harris using windowed sums 
+    int harrisWindow = 3; 
     float harrisK = 0.04f;
     harrisWindowKernel<<<blocks, threads>>>(d_nms, d_Ix, d_Iy, d_harris, width, height, harrisWindow, harrisK);
     CHECK_CUDA(cudaGetLastError());
@@ -137,9 +137,7 @@ void getDescriptors(unsigned char* d_img, std::vector<unsigned char> feature_vec
 
     std::cout << "Applying Gaussian Blur..." << std::endl;
 
-    // =================================================================
-    // STEP 1: RUN GAUSSIAN BLUR (OPTIMIZED)
-    // =================================================================
+    // Gaussian Blur
     dim3 blurBlock(16, 16);
     dim3 blurGrid((w1 + 15) / 16, (h1 + 15) / 16);
     
@@ -149,9 +147,7 @@ void getDescriptors(unsigned char* d_img, std::vector<unsigned char> feature_vec
 
     std::cout << "Running ORB Kernel..." << std::endl;
 
-    // =================================================================
-    // STEP 2: RUN ORB KERNEL (OPTIMIZED WITH DYNAMIC SMEM)
-    // =================================================================
+    // ORB
     int threadsPerBlock = 256;
     int blocksPerGrid = (imgSize + threadsPerBlock - 1) / threadsPerBlock;
     size_t smemSize = (1024 * sizeof(int)) + (33 * 33 * sizeof(unsigned char));
@@ -234,7 +230,7 @@ void match(const char* img1Path, const char* img2Path)
     loadDescriptorFile(descName1.c_str(), h_desc1);
     loadDescriptorFile(descName2.c_str(), h_desc2);
 
-    // Calculate number of descriptors (Total Ints / 8 Ints per Desc)
+    // Calculate number of descriptors 
     int numDesc1 = h_desc1.size() / 8;
     int numDesc2 = h_desc2.size() / 8;
 
@@ -242,9 +238,7 @@ void match(const char* img1Path, const char* img2Path)
     std::cout << "Image 2 Descriptors: " << numDesc2 << "\n";
     std::cout << "Total Comparisons: " << (long)numDesc1 * (long)numDesc2 << "\n";
 
-    // -----------------------------------------------------
-    // GPU Allocation
-    // -----------------------------------------------------
+    
     unsigned int *d_desc1, *d_desc2;
     MatchResult *d_matches;
 
@@ -256,9 +250,7 @@ void match(const char* img1Path, const char* img2Path)
     cudaMemcpy(d_desc1, h_desc1.data(), h_desc1.size() * sizeof(unsigned int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_desc2, h_desc2.data(), h_desc2.size() * sizeof(unsigned int), cudaMemcpyHostToDevice);
 
-    // -----------------------------------------------------
-    // Launch Kernel
-    // -----------------------------------------------------
+ 
     dim3 threads(256);
     dim3 blocks((numDesc1 + 255) / 256);
 
@@ -267,19 +259,11 @@ void match(const char* img1Path, const char* img2Path)
     
     cudaDeviceSynchronize();
 
-    // -----------------------------------------------------
-    // Download Results
-    // -----------------------------------------------------
+
     std::vector<MatchResult> h_matches(numDesc1);
     cudaMemcpy(h_matches.data(), d_matches, numDesc1 * sizeof(MatchResult), cudaMemcpyDeviceToHost);
 
-    // -----------------------------------------------------
-    // Save to Disk (for Python)
-    // -----------------------------------------------------
-    // We write a simple binary format:
-    // [QueryIndex (int), TrainIndex (int), Distance (float), SecondDistance (float)]
-    // We use float for distances to match standard OpenCV DMatch structs commonly used in Python.
-    
+
     FILE* f = fopen(outName.c_str(), "wb");
 
     int saved = 0;
@@ -309,24 +293,22 @@ void match(const char* img1Path, const char* img2Path)
 
 void stitch(const char* img1Path, const char* img2Path, const char* outimg)
 {
-    auto stripExt = [](const std::string& s) {
-    size_t i = s.find_last_of(".");
-    return (i == std::string::npos) ? s : s.substr(0, i);
+   auto stripExt = [](const std::string& s) {
+        size_t i = s.find_last_of(".");
+        return (i == std::string::npos) ? s : s.substr(0, i);
     };
     std::string base1 = stripExt(std::string(img1Path));
-    std::string descName1 = base1 + ".descriptors.bin";
     std::string kpName1   = base1 + ".kp.bin";
     std::string base2 = stripExt(std::string(img2Path));
-    std::string descName2 = base2 + ".descriptors.bin";
     std::string kpName2   = base2 + ".kp.bin";
     std::string matches = base1 + ".matches.bin";
 
-    // 1. Load Images (RGB)
+    // Load Images (RGB)
     int w1, h1, c1, w2, h2, c2;
     unsigned char* img1 = stbi_load(img1Path, &w1, &h1, &c1, 3); 
     unsigned char* img2 = stbi_load(img2Path, &w2, &h2, &c2, 3);
 
-    // 2. Load Matches & Keypoints
+    // Load Matches & Keypoints
     struct MatchEntry { int qIdx; int tIdx; float dist; float secDist; };
     std::vector<Point2f> hostPts1, hostPts2;
     std::vector<Point2f> allKp1, allKp2;
@@ -340,7 +322,6 @@ void stitch(const char* img1Path, const char* img2Path, const char* outimg)
     loadKPs(kpName2.c_str(), allKp2);
 
     FILE* f = fopen(matches.c_str(), "rb");
-    
     MatchEntry entry;
     while(fread(&entry, sizeof(entry), 1, f)) {
         if(entry.dist < 0.75f * entry.secDist) {
@@ -353,61 +334,54 @@ void stitch(const char* img1Path, const char* img2Path, const char* outimg)
     fclose(f);
 
     int numMatches = hostPts1.size();
+    if (numMatches < 4) { std::cerr << "Not enough matches.\n"; return; }
 
-    // =========================================================
-    // NORMALIZE POINTS (CRITICAL FIX FOR GPU PRECISION)
-    // =========================================================
+    
     std::vector<Point2f> normPts1, normPts2;
     Mat3x3 T1, T2;
     normalizePoints(hostPts1, normPts1, T1);
     normalizePoints(hostPts2, normPts2, T2);
 
-    // 3. GPU RANSAC
+    // RANSAC
     Point2f *d_pts1, *d_pts2;
     float *d_bestH;
     int *d_maxInliers;
-    
-    cudaMalloc(&d_pts1, numMatches * sizeof(Point2f));
-    cudaMalloc(&d_pts2, numMatches * sizeof(Point2f));
-    cudaMalloc(&d_bestH, 9 * sizeof(float));
-    cudaMalloc(&d_maxInliers, sizeof(int));
+    int *d_mutex; 
 
-    // Upload NORMALIZED points
-    cudaMemcpy(d_pts1, normPts1.data(), numMatches * sizeof(Point2f), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_pts2, normPts2.data(), numMatches * sizeof(Point2f), cudaMemcpyHostToDevice);
-    cudaMemset(d_maxInliers, 0, sizeof(int));
+    CHECK_CUDA(cudaMalloc(&d_pts1, numMatches * sizeof(Point2f)));
+    CHECK_CUDA(cudaMalloc(&d_pts2, numMatches * sizeof(Point2f)));
+    CHECK_CUDA(cudaMalloc(&d_bestH, 9 * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_maxInliers, sizeof(int)));
+    CHECK_CUDA(cudaMalloc(&d_mutex, sizeof(int))); // Allocate Mutex
 
-    // Launch RANSAC using Normalized Threshold (e.g. 0.01 instead of 5.0 pixels)
-    // Since we scaled by roughly 1/(width), 5.0 pixels becomes very small.
-    // Standard approach: 5.0 * scale_factor. Or just use a small float like 0.05.
-    ransacKernel<<<(2048+255)/256, 256>>>(d_pts2, d_pts1, numMatches, d_bestH, d_maxInliers, 2048, 0.01f);
-    cudaDeviceSynchronize();
+    CHECK_CUDA(cudaMemcpy(d_pts1, normPts1.data(), numMatches * sizeof(Point2f), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_pts2, normPts2.data(), numMatches * sizeof(Point2f), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemset(d_maxInliers, 0, sizeof(int)));
+    CHECK_CUDA(cudaMemset(d_mutex, 0, sizeof(int))); // Init Mutex to 0
+
+    ransacBlockKernel<<<2048, 256>>>(d_pts2, d_pts1, numMatches, d_bestH, d_maxInliers, d_mutex, 0.01f);
+    CHECK_CUDA(cudaDeviceSynchronize());
 
     float h_norm[9];
     int maxInliers = 0;
-    cudaMemcpy(h_norm, d_bestH, 9 * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&maxInliers, d_maxInliers, sizeof(int), cudaMemcpyDeviceToHost);
+    CHECK_CUDA(cudaMemcpy(h_norm, d_bestH, 9 * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(&maxInliers, d_maxInliers, sizeof(int), cudaMemcpyDeviceToHost));
     std::cout << "RANSAC Best Inliers: " << maxInliers << "\n";
 
-    // =========================================================
-    // DENORMALIZE HOMOGRAPHY: H = T1^-1 * H_norm * T2
-    // =========================================================
+    if (maxInliers < 4) { std::cerr << "RANSAC failed.\n"; return; }
+
+
     Mat3x3 H_norm;
     for(int i=0; i<9; i++) H_norm.data[i] = h_norm[i];
-    
     Mat3x3 H = T1.inverse() * H_norm * T2;
 
-    // 4. Calculate Canvas
     Point2f corners[4] = {{0,0}, {0,(float)h2}, {(float)w2,(float)h2}, {(float)w2,0}};
-    Point2f transCorners[4];
     float x_min = 0, x_max = w1, y_min = 0, y_max = h1;
 
     for(int i=0; i<4; i++) {
-        transCorners[i] = H.transform(corners[i]);
-        if(transCorners[i].x < x_min) x_min = transCorners[i].x;
-        if(transCorners[i].x > x_max) x_max = transCorners[i].x;
-        if(transCorners[i].y < y_min) y_min = transCorners[i].y;
-        if(transCorners[i].y > y_max) y_max = transCorners[i].y;
+        Point2f p = H.transform(corners[i]);
+        if(p.x < x_min) x_min = p.x; if(p.x > x_max) x_max = p.x;
+        if(p.y < y_min) y_min = p.y; if(p.y > y_max) y_max = p.y;
     }
 
     int canvasW = ceil(x_max - x_min);
@@ -418,45 +392,74 @@ void stitch(const char* img1Path, const char* img2Path, const char* outimg)
     Mat3x3 T_shift = Mat3x3::identity();
     T_shift.data[2] = -offX; 
     T_shift.data[5] = -offY; 
-    
     Mat3x3 H_final = T_shift * H;
     Mat3x3 H_inv = H_final.inverse();
 
-    // 5. Warp & Paste
-    unsigned char *d_img1, *d_img2, *d_canvas;
+    // Warp And Paste Onto Canvas
+    unsigned char *d_img1, *d_canvas;
     float *d_H_inv;
     
-    cudaMalloc(&d_img1, w1 * h1 * 3);
-    cudaMalloc(&d_img2, w2 * h2 * 3);
-    cudaMalloc(&d_canvas, canvasW * canvasH * 3);
-    cudaMalloc(&d_H_inv, 9 * sizeof(float));
+    CHECK_CUDA(cudaMalloc(&d_img1, w1 * h1 * 3));
+    CHECK_CUDA(cudaMalloc(&d_canvas, canvasW * canvasH * 3));
+    CHECK_CUDA(cudaMalloc(&d_H_inv, 9 * sizeof(float)));
     
-    cudaMemset(d_canvas, 0, canvasW * canvasH * 3);
-    cudaMemcpy(d_img1, img1, w1 * h1 * 3, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_img2, img2, w2 * h2 * 3, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_H_inv, H_inv.data, 9 * sizeof(float), cudaMemcpyHostToDevice);
+    CHECK_CUDA(cudaMemset(d_canvas, 0, canvasW * canvasH * 3));
+    CHECK_CUDA(cudaMemcpy(d_img1, img1, w1 * h1 * 3, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_H_inv, H_inv.data, 9 * sizeof(float), cudaMemcpyHostToDevice));
+
+    // Convert RGB (3 bytes) to RGBA (4 bytes) for performance
+    std::vector<uchar4> host_img2_rgba(w2 * h2);
+    for(int i=0; i < w2*h2; i++) {
+        host_img2_rgba[i].x = img2[i*3 + 0];
+        host_img2_rgba[i].y = img2[i*3 + 1];
+        host_img2_rgba[i].z = img2[i*3 + 2];
+        host_img2_rgba[i].w = 255; // Alpha
+    }
+
+    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<uchar4>();
+    cudaArray_t cuArray;
+    CHECK_CUDA(cudaMallocArray(&cuArray, &channelDesc, w2, h2));
+    CHECK_CUDA(cudaMemcpyToArray(cuArray, 0, 0, host_img2_rgba.data(), w2*h2*sizeof(uchar4), cudaMemcpyHostToDevice));
+
+    struct cudaResourceDesc resDesc;
+    memset(&resDesc, 0, sizeof(resDesc));
+    resDesc.resType = cudaResourceTypeArray;
+    resDesc.res.array.array = cuArray;
+
+    // Create special CUDA texture object for performance
+    struct cudaTextureDesc texDesc;
+    memset(&texDesc, 0, sizeof(texDesc));
+    texDesc.addressMode[0] = cudaAddressModeBorder; 
+    texDesc.addressMode[1] = cudaAddressModeBorder;
+    texDesc.filterMode = cudaFilterModeLinear;      
+    texDesc.readMode = cudaReadModeNormalizedFloat; 
+    
+    float borderColor[4] = {0.0f, 0.0f, 0.0f, 0.0f}; 
+    memcpy(texDesc.borderColor, borderColor, sizeof(borderColor));
+
+    cudaTextureObject_t texObj;
+    CHECK_CUDA(cudaCreateTextureObject(&texObj, &resDesc, &texDesc, NULL));
 
     dim3 threads(16, 16);
-    dim3 grid((canvasW + 15)/16, (canvasH + 15)/16);
-    
-    warpKernel<<<grid, threads>>>(d_img2, d_canvas, 
-                                  w2, h2, canvasW, canvasH,
-                                  d_H_inv, 0, 0); 
-                                  
+    dim3 gridWarp((canvasW + 15)/16, (canvasH + 15)/16);
     dim3 gridPaste((w1 + 15)/16, (h1 + 15)/16);
-    pasteKernel<<<gridPaste, threads>>>(d_img1, d_canvas,
-                                        w1, h1, canvasW, canvasH,
-                                        offX, offY);
 
-    cudaDeviceSynchronize();
+    warpTextureKernel<<<gridWarp, threads>>>(texObj, d_canvas, canvasW, canvasH, d_H_inv, 0, 0); 
+    
+    pasteKernel<<<gridPaste, threads>>>(d_img1, d_canvas, w1, h1, canvasW, canvasH, offX, offY);
+
+    CHECK_CUDA(cudaDeviceSynchronize());
     
     std::vector<unsigned char> result(canvasW * canvasH * 3);
-    cudaMemcpy(result.data(), d_canvas, canvasW * canvasH * 3, cudaMemcpyDeviceToHost);
+    CHECK_CUDA(cudaMemcpy(result.data(), d_canvas, canvasW * canvasH * 3, cudaMemcpyDeviceToHost));
     
     stbi_write_jpg(outimg, canvasW, canvasH, 3, result.data(), 100);
 
-    cudaFree(d_pts1); cudaFree(d_pts2); cudaFree(d_bestH); cudaFree(d_maxInliers);
-    cudaFree(d_img1); cudaFree(d_img2); cudaFree(d_canvas); cudaFree(d_H_inv);
+    // Cleanup
+    cudaDestroyTextureObject(texObj);
+    cudaFreeArray(cuArray);
+    cudaFree(d_pts1); cudaFree(d_pts2); cudaFree(d_bestH); cudaFree(d_maxInliers); cudaFree(d_mutex);
+    cudaFree(d_img1); cudaFree(d_canvas); cudaFree(d_H_inv);
     stbi_image_free(img1); stbi_image_free(img2);
 
     std::cout << "Saved " << outimg << "\n";
